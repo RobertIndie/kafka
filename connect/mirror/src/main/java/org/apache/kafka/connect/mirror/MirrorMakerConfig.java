@@ -201,6 +201,7 @@ public class MirrorMakerConfig extends AbstractConfig {
         // fill in reasonable defaults
         props.putIfAbsent(CommonClientConfigs.CLIENT_ID_CONFIG, sourceAndTarget.toString());
         props.putIfAbsent(GROUP_ID_CONFIG, sourceAndTarget.source() + "-mm2");
+        // TODO: MM2 will create thw following internal topics
         props.putIfAbsent(DistributedConfig.OFFSET_STORAGE_TOPIC_CONFIG, "mm2-offsets."
                 + sourceAndTarget.source() + ".internal");
         props.putIfAbsent(DistributedConfig.STATUS_STORAGE_TOPIC_CONFIG, "mm2-status."
@@ -308,7 +309,7 @@ public class MirrorMakerConfig extends AbstractConfig {
     }
 
     private Map<String, String> stringsWithPrefix(String prefix) {
-        return Utils.entriesWithPrefix(rawProperties, prefix, false, true);
+        return Utils.entriesWithPrefix(rawProperties, prefix, false);
     }
 
     static Map<String, String> clusterConfigsWithPrefix(String prefix, Map<String, String> props) {
