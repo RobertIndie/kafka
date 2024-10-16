@@ -81,7 +81,11 @@ import java.util.OptionalLong;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
@@ -113,8 +117,8 @@ public class MirrorSourceTask extends SourceTask {
     private boolean stopping = false;
     private Semaphore consumerAccess;
     private OffsetSyncWriter offsetSyncWriter;
-    private CompletableFuture<MetadataCache<ManagedLedgerMetadata>> metadataCache;
-    private CompletableFuture<PersistStorageApi> storageApi;
+    private MetadataCache<ManagedLedgerMetadata> metadataCache;
+    private PersistStorageApi storageApi;
     private EntryFormatter entryFormatter;
 
     public MirrorSourceTask() {}
@@ -168,7 +172,7 @@ public class MirrorSourceTask extends SourceTask {
             metadataCache = oxiaClient.thenApply(oxia -> {
                     MetadataStore store = new OxiaMetadataStore(oxia, "identity");
                     return store.getMetadataCache(ManagedLedgerMetadata.class);
-                });
+                }).join();
             storageApi = oxiaClient.thenApply(oxia -> {
                 try {
                     PulsarStorageConfig pulsarStorageConfig = new PulsarStorageConfig();
@@ -184,13 +188,13 @@ public class MirrorSourceTask extends SourceTask {
                     WalStorage innerStorage =
                         WalStorageFactory.create(pulsarStorageConfig, PulsarByteBufAllocator.DEFAULT, fileStorage,
                             idGenerator, InstrumentProvider.NOOP);
+                    innerStorage.initialize();
                     return new PersistStorageApi(pulsarStorageConfig, oxia, innerStorage,
                         InstrumentProvider.NOOP);
                 } catch (Exception e) {
                     throw new IllegalArgumentException("Failed to create storage API", e);
                 }
-
-            });
+            }).join();
         } catch (Exception e) {
             throw new IllegalArgumentException("Failed to validate Oixa URL", e);
         }
@@ -235,6 +239,12 @@ public class MirrorSourceTask extends SourceTask {
         return new MirrorSourceConnector().version();
     }
 
+    public static class RetryException extends RuntimeException {
+        public RetryException(Throwable cause) {
+            super(cause);
+        }
+    }
+
     @Override
     public List<SourceRecord> poll() {
         if (!consumerAccess.tryAcquire()) {
@@ -260,7 +270,9 @@ public class MirrorSourceTask extends SourceTask {
             } else {
                 System.out.println("RBT: Received " + sourceRecords.size() + " records from " + records.partitions());
                 log.trace("Polled {} records from {}.", sourceRecords.size(), records.partitions());
+                // TODO: Make it async with throttling
                 writeToUrsa(sourceRecords).join();
+                consumer.commitSync();
                 return null;
             }
         } catch (WakeupException e) {
@@ -328,10 +340,69 @@ public class MirrorSourceTask extends SourceTask {
     }
 
     static String getPath(final TopicPartition topicPartition) throws InvalidTopicException {
-        String pulsarTopic = TopicNameUtils.kafkaToPulsar(topicPartition.toString(),
+        String pulsarTopic = TopicNameUtils.kafkaToPulsar(topicPartition.topic(),
             "public/default/");
-        String mlName = TopicName.get(pulsarTopic).getPersistenceNamingEncoding();
+        String mlName =
+            TopicName.get(pulsarTopic + "-partition-" + topicPartition.partition()).getPersistenceNamingEncoding();
         return "/managed-ledgers/" + mlName;
+    }
+
+    CompletableFuture<ManagedLedgerMetadata> getMLMetadata(final TopicPartition topicPartition) {
+        return metadataCache.get(getPath(topicPartition))
+            .thenApply(metadata -> {
+                if (!metadata.isPresent()) {
+                    throw new RetryException(new IllegalStateException("ManagedLedger metadata not found for " + topicPartition));
+                }
+                return metadata.get();
+            }).whenComplete((v, e) -> {
+                if (e == null) {
+                    return;
+                }
+                if (e.getCause() instanceof MetadataStoreException.ContentDeserializationException) {
+                    throw new RetryException(e);
+                }
+                throw new CompletionException(e.getCause());
+            });
+    }
+
+    private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
+
+    CompletableFuture<ManagedLedgerMetadata> getMLMetadataWithRetry(final TopicPartition topicPartition) {
+        return getMLMetadataWithRetry(topicPartition, 0);
+    }
+
+    private CompletableFuture<ManagedLedgerMetadata> getMLMetadataWithRetry(final TopicPartition topicPartition, int retryCount) {
+        return getMLMetadata(topicPartition).handle((result, ex) -> {
+            if (ex != null) {
+                if (ex instanceof RetryException) {
+                    if (retryCount >= 10) {
+                        log.error("Failed to getMLMetadata for {} after {} retries", topicPartition, retryCount, ex);
+                        throw new CompletionException(ex.getCause());
+                    }
+                    log.warn("Retrying getMLMetadata for {}. Attempt: {}", topicPartition, retryCount + 1, ex);
+                    return null; // Indicate a retry is needed
+                } else {
+                    throw new CompletionException(ex);
+                }
+            }
+            return result;
+        }).thenCompose(result -> {
+            if (result == null) {
+                CompletableFuture<ManagedLedgerMetadata> delayedFuture = new CompletableFuture<>();
+                scheduler.schedule(() -> {
+                    getMLMetadataWithRetry(topicPartition, retryCount + 1).whenComplete((res, exc) -> {
+                        if (exc != null) {
+                            delayedFuture.completeExceptionally(exc);
+                        } else {
+                            delayedFuture.complete(res);
+                        }
+                    });
+                }, 1, TimeUnit.SECONDS);
+                return delayedFuture;
+            } else {
+                return CompletableFuture.completedFuture(result);
+            }
+        });
     }
 
     CompletableFuture<Void> writeToUrsa(List<SourceRecord> sourceRecords) {
@@ -361,30 +432,45 @@ public class MirrorSourceTask extends SourceTask {
                 false,
                 false,
                 validBytesCount.get(),
-                (int)entry.getValue().firstOffset,
-                (int)entry.getValue().firstOffset + entry.getValue().numberOfMessages,
+                (int) entry.getValue().firstOffset,
+                (int) entry.getValue().firstOffset + entry.getValue().numberOfMessages,
                 DEFAULT_COMPRESSION,
                 DEFAULT_COMPRESSION,
                 false
             ));
             EncodeResult result = entryFormatter.encode(request);
-            CompletableFuture<Void> future = metadataCache.thenCompose(
-                cache -> cache.get(getPath(entry.getKey())).thenCompose(metadata -> {
-                    if (!metadata.isPresent()) {
-                        throw new IllegalStateException("ManagedLedger metadata not found for " + entry.getKey());
+            CompletableFuture<Void> future = getMLMetadataWithRetry(entry.getKey()).thenCompose(
+                    metadata -> storageApi.append(metadata.streamId, recordsContext.numberOfMessages,
+                        result.getEncodedByteBuf())
+                ).whenComplete((v, e) -> {
+                    if (e instanceof MetadataStoreException.ContentDeserializationException) {
+                        throw new RetryException(e);
                     }
-                    return storageApi.thenCompose(storage ->
-                        storage.append(metadata.get().streamId, recordsContext.numberOfMessages, result.getEncodedByteBuf()));
+                    if (e != null) {
+                        throw new CompletionException(e);
+                    }
                 })
-            ).thenCompose(entryHeader -> {
-                if (entryHeader == null) {
-                    throw new IllegalStateException("Failed to append to storage");
-                }
-                return CompletableFuture.completedFuture(null); // TODO: Invoke commitRecord
-            });
+                .thenCompose(entryHeader -> {
+                    if (entryHeader == null) {
+                        throw new IllegalStateException("Failed to append to storage");
+                    }
+                    return CompletableFuture.completedFuture(null);
+                });
             futures.add(future);
         }
         return CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]));
+    }
+
+    private void recordsReplicated(List<SourceRecord> records) {
+        if (records.isEmpty()) {
+            return;
+        }
+        for (SourceRecord record : records) {
+            TopicPartition topicPartition = new TopicPartition(record.topic(), record.kafkaPartition());
+            long latency = System.currentTimeMillis() - record.timestamp();
+            metrics.countRecord(topicPartition);
+            metrics.replicationLatency(topicPartition, latency);
+        }
     }
  
     @Override
@@ -392,6 +478,7 @@ public class MirrorSourceTask extends SourceTask {
         if (stopping) {
             return;
         }
+        consumer.commitAsync();
         if (metadata == null) {
             log.debug("No RecordMetadata (source record was probably filtered out during transformation) -- can't sync offsets for {}.", record.topic());
             return;
@@ -431,17 +518,18 @@ public class MirrorSourceTask extends SourceTask {
         consumer.assign(topicPartitionOffsets.keySet());
         log.info("Starting with {} previously uncommitted partitions.", topicPartitionOffsets.values().stream()
                 .filter(this::isUncommitted).count());
+        // TODO: We don't assign the offset. Simplify this logic.
 
-        topicPartitionOffsets.forEach((topicPartition, offset) -> {
-            // Do not call seek on partitions that don't have an existing offset committed.
-            if (isUncommitted(offset)) {
-                log.trace("Skipping seeking offset for topicPartition: {}", topicPartition);
-                return;
-            }
-            long nextOffsetToCommittedOffset = offset + 1L;
-            log.trace("Seeking to offset {} for topicPartition: {}", nextOffsetToCommittedOffset, topicPartition);
-            consumer.seek(topicPartition, nextOffsetToCommittedOffset);
-        });
+//        topicPartitionOffsets.forEach((topicPartition, offset) -> {
+//            // Do not call seek on partitions that don't have an existing offset committed.
+//            if (isUncommitted(offset)) {
+//                log.trace("Skipping seeking offset for topicPartition: {}", topicPartition);
+//                return;
+//            }
+//            long nextOffsetToCommittedOffset = offset + 1L;
+//            log.trace("Seeking to offset {} for topicPartition: {}", nextOffsetToCommittedOffset, topicPartition);
+//            consumer.seek(topicPartition, nextOffsetToCommittedOffset);
+//        });
     }
 
     // visible for testing 

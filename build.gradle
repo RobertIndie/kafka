@@ -129,6 +129,9 @@ allprojects {
   repositories {
     mavenLocal()
     mavenCentral()
+    maven {
+      url 'https://packages.confluent.io/maven/'
+    }
   }
 
   dependencyUpdates {
@@ -3646,9 +3649,9 @@ project(':connect:mirror') {
     onlyIf { false }
   }
 
-  // Seems no work!
-  sourceCompatibility = JavaVersion.VERSION_17
-  targetCompatibility = JavaVersion.VERSION_17
+  // Seems no work for testing.
+//  sourceCompatibility = JavaVersion.VERSION_17
+//  targetCompatibility = JavaVersion.VERSION_17
 
   dependencies {
 //    implementation project(':connect:api')
@@ -3689,6 +3692,7 @@ project(':connect:mirror') {
     implementation 'org.glassfish.jersey.containers:jersey-container-servlet-core:2.34'
     implementation 'org.glassfish.jersey.media:jersey-media-json-jackson:2.34'
     implementation 'javax.ws.rs:javax.ws.rs-api:2.1.1'
+    implementation 'org.lz4:lz4-java:1.8.0'
 
     testImplementation libs.junitJupiter
     testImplementation libs.reload4j
@@ -3699,6 +3703,7 @@ project(':connect:mirror') {
     testImplementation project(':core').sourceSets.test.output
     testImplementation project(':server')
     testImplementation project(':server-common').sourceSets.test.output
+    testImplementation 'io.confluent:kafka-avro-serializer:7.5.0'
 
     testRuntimeOnly project(':connect:runtime')
     testRuntimeOnly libs.slf4jReload4j

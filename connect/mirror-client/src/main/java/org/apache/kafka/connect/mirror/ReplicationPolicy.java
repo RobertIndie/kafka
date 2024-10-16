@@ -101,12 +101,17 @@ public interface ReplicationPolicy {
         return  topic.endsWith(".internal");
     }
 
+    default boolean isSchemaTopic(String topic) {
+        return topic.equals("_schemas");
+    }
+
     /**
      * Returns true if the topic is considered an internal topic.
      */
     default boolean isInternalTopic(String topic) {
         boolean isKafkaInternalTopic = topic.startsWith("__") || topic.startsWith(".");
         boolean isDefaultConnectTopic =  topic.endsWith("-internal") ||  topic.endsWith(".internal");
-        return isMM2InternalTopic(topic) || isKafkaInternalTopic || isDefaultConnectTopic;
+        boolean isSchemaTopic = isSchemaTopic(topic);
+        return isMM2InternalTopic(topic) || isKafkaInternalTopic || isDefaultConnectTopic || isSchemaTopic;
     }
 }

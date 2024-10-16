@@ -63,7 +63,8 @@ public class DefaultReplicationPolicy implements ReplicationPolicy, Configurable
 
     @Override
     public String formatRemoteTopic(String sourceClusterAlias, String topic) {
-        return sourceClusterAlias + separator + topic;
+//        return sourceClusterAlias + separator + topic;
+        return topic;
     }
 
     @Override

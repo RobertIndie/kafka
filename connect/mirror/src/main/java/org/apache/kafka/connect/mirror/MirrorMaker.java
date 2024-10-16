@@ -109,9 +109,10 @@ public class MirrorMaker {
 
     public static final List<Class<?>> CONNECTOR_CLASSES = Collections.unmodifiableList(
         Arrays.asList(
-            MirrorSourceConnector.class,
-            MirrorHeartbeatConnector.class,
-            MirrorCheckpointConnector.class));
+            MirrorSourceConnector.class
+//            MirrorHeartbeatConnector.class,
+//            MirrorCheckpointConnector.class
+            ));
 
     private final Map<SourceAndTarget, Herder> herders = new HashMap<>();
     private CountDownLatch startLatch;
@@ -159,7 +160,7 @@ public class MirrorMaker {
         if (herderPairs.isEmpty()) {
             throw new IllegalArgumentException("No source->target replication flows.");
         }
-        herderPairs.forEach(this::addHerder);
+        herderPairs.forEach(this::addHerder); // Add herder here.
         shutdownHook = new ShutdownHook();
     }
 
